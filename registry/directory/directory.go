@@ -54,7 +54,7 @@ func init() {
 type RegistryDirectory struct {
 	directory.BaseDirectory
 	cacheInvokers                  []protocol.Invoker
-	listenerLock                   sync.Mutex
+	invokersLock                   sync.RWMutex
 	serviceType                    string
 	registry                       registry.Registry
 	cacheInvokersMap               *sync.Map // use sync.map
@@ -86,6 +86,7 @@ func NewRegistryDirectory(url *common.URL, registry registry.Registry) (cluster.
 
 	if routerChain, err := chain.NewRouterChain(dir.consumerURL); err == nil {
 		dir.BaseDirectory.SetRouterChain(routerChain)
+		dir.AddRouters(fileBasedRouterUrls())
 	} else {
 		logger.Warnf("fail to create router chain with url: %s, err is: %v", url.SubURL, err)
 	}
@@ -185,18 +186,21 @@ func (dir *RegistryDirectory) refreshAllInvokers(events []*registry.ServiceEvent
 			}
 		}
 		// loop the updateEvents
+		var routerUrls []*common.URL
 		for _, event := range addEvents {
 			logger.Debugf("registry update, result{%s}", event)
 			if event.Service != nil {
 				logger.Infof("selector add service url{%s}", event.Service.String())
 			}
 			if event != nil && event.Service != nil && constant.ROUTER_PROTOCOL == event.Service.Protocol {
-				dir.configRouters()
+				routerUrls = append(routerUrls, event.Service)
+				continue
 			}
 			if oldInvoker, _ := dir.doCacheInvoker(event.Service); oldInvoker != nil {
 				oldInvokers = append(oldInvokers, oldInvoker)
 			}
 		}
+		dir.AddRouters(append(fileBasedRouterUrls(), routerUrls...))
 	}()
 	dir.setNewInvokers()
 	// destroy unused invokers
@@ -230,8 +234,8 @@ func (dir *RegistryDirectory) invokerCacheKey(event *registry.ServiceEvent) stri
 // setNewInvokers groups the invokers from the cache first, then set the result to both directory and router chain.
 func (dir *RegistryDirectory) setNewInvokers() {
 	newInvokers := dir.toGroupInvokers()
-	dir.listenerLock.Lock()
-	defer dir.listenerLock.Unlock()
+	dir.invokersLock.Lock()
+	defer dir.invokersLock.Unlock()
 	dir.cacheInvokers = newInvokers
 	dir.RouterChain().SetInvokers(newInvokers)
 }
@@ -245,7 +249,8 @@ func (dir *RegistryDirectory) cacheInvokerByEvent(event *registry.ServiceEvent) 
 		case remoting.EventTypeAdd, remoting.EventTypeUpdate:
 			logger.Infof("selector add service url{%s}", event.Service)
 			if u != nil && constant.ROUTER_PROTOCOL == u.Protocol {
-				dir.configRouters()
+				dir.AddRouters(append(fileBasedRouterUrls(), u))
+				return nil, nil
 			}
 			return dir.cacheInvoker(u), nil
 		case remoting.EventTypeDel:
@@ -256,18 +261,6 @@ func (dir *RegistryDirectory) cacheInvokerByEvent(event *registry.ServiceEvent) 
 		}
 	}
 	return nil, nil
-}
-
-// configRouters configures dynamic routers into the router chain, but, the current impl is incorrect, see FIXME above.
-func (dir *RegistryDirectory) configRouters() {
-	var urls []*common.URL
-	for _, v := range config.GetRouterURLSet().Values() {
-		urls = append(urls, v.(*common.URL))
-	}
-
-	if len(urls) > 0 {
-		dir.SetRouters(urls)
-	}
 }
 
 // convertUrl processes override:// and router://
@@ -297,7 +290,7 @@ func (dir *RegistryDirectory) toGroupInvokers() []protocol.Invoker {
 	})
 
 	for _, invoker := range newInvokersList {
-		group := invoker.GetUrl().GetParam(constant.GROUP_KEY, "")
+		group := invoker.GetURL().GetParam(constant.GROUP_KEY, "")
 
 		groupInvokersMap[group] = append(groupInvokersMap[group], invoker)
 	}
@@ -310,7 +303,7 @@ func (dir *RegistryDirectory) toGroupInvokers() []protocol.Invoker {
 	} else {
 		for _, invokers := range groupInvokersMap {
 			staticDir := directory.NewStaticDirectory(invokers)
-			cst := extension.GetCluster(dir.GetUrl().SubURL.GetParam(constant.CLUSTER_KEY, constant.DEFAULT_CLUSTER))
+			cst := extension.GetCluster(dir.GetURL().SubURL.GetParam(constant.CLUSTER_KEY, constant.DEFAULT_CLUSTER))
 			err = staticDir.BuildRouterChain(invokers)
 			if err != nil {
 				logger.Error(err)
@@ -376,11 +369,11 @@ func (dir *RegistryDirectory) doCacheInvoker(newUrl *common.URL) (protocol.Invok
 	} else {
 		// if cached invoker has the same URL with the new URL, then no need to re-refer, and no need to destroy
 		// the old invoker.
-		if common.GetCompareURLEqualFunc()(newUrl, cacheInvoker.(protocol.Invoker).GetUrl()) {
+		if common.GetCompareURLEqualFunc()(newUrl, cacheInvoker.(protocol.Invoker).GetURL()) {
 			return nil, true
 		}
 
-		logger.Debugf("service will be updated in cache invokers: new invoker url is %s, old invoker url is %s", newUrl, cacheInvoker.(protocol.Invoker).GetUrl())
+		logger.Debugf("service will be updated in cache invokers: new invoker url is %s, old invoker url is %s", newUrl, cacheInvoker.(protocol.Invoker).GetURL())
 		newInvoker := extension.GetProtocol(protocolwrapper.FILTER).Refer(newUrl)
 		if newInvoker != nil {
 			dir.cacheInvokersMap.Store(key, newInvoker)
@@ -394,11 +387,12 @@ func (dir *RegistryDirectory) doCacheInvoker(newUrl *common.URL) (protocol.Invok
 
 // List selected protocol invokers from the directory
 func (dir *RegistryDirectory) List(invocation protocol.Invocation) []protocol.Invoker {
-	invokers := dir.cacheInvokers
 	routerChain := dir.RouterChain()
 
 	if routerChain == nil {
-		return invokers
+		dir.invokersLock.RLock()
+		defer dir.invokersLock.RUnlock()
+		return dir.cacheInvokers
 	}
 	return routerChain.Route(dir.consumerURL, invocation)
 }
@@ -458,6 +452,15 @@ func doOverrideUrl(configurators []config_center.Configurator, targetUrl *common
 	for _, v := range configurators {
 		v.Configure(targetUrl)
 	}
+}
+
+// build static configured router from local router config
+func fileBasedRouterUrls() []*common.URL {
+	var urls []*common.URL
+	for _, v := range config.GetRouterURLSet().Values() {
+		urls = append(urls, v.(*common.URL))
+	}
+	return urls
 }
 
 type referenceConfigurationListener struct {

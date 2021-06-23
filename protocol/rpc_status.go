@@ -203,21 +203,21 @@ func CleanAllStatus() {
 
 // GetInvokerHealthyStatus get invoker's conn healthy status
 func GetInvokerHealthyStatus(invoker Invoker) bool {
-	_, found := invokerBlackList.Load(invoker.GetUrl().Key())
+	_, found := invokerBlackList.Load(invoker.GetURL().Key())
 	return !found
 }
 
 // SetInvokerUnhealthyStatus add target invoker to black list
 func SetInvokerUnhealthyStatus(invoker Invoker) {
-	invokerBlackList.Store(invoker.GetUrl().Key(), invoker)
-	logger.Info("Add invoker ip = ", invoker.GetUrl().Location, " to black list")
+	invokerBlackList.Store(invoker.GetURL().Key(), invoker)
+	logger.Info("Add invoker ip = ", invoker.GetURL().Location, " to black list")
 	blackListCacheDirty.Store(true)
 }
 
 // RemoveInvokerUnhealthyStatus remove unhealthy status of target invoker from blacklist
 func RemoveInvokerUnhealthyStatus(invoker Invoker) {
-	invokerBlackList.Delete(invoker.GetUrl().Key())
-	logger.Info("Remove invoker ip = ", invoker.GetUrl().Location, " from black list")
+	invokerBlackList.Delete(invoker.GetURL().Key())
+	logger.Info("Remove invoker ip = ", invoker.GetURL().Location, " from black list")
 	blackListCacheDirty.Store(true)
 }
 
@@ -251,25 +251,27 @@ func GetAndRefreshState() bool {
 // if target invoker is available, then remove it from black list
 func TryRefreshBlackList() {
 	if atomic.CompareAndSwapInt32(&blackListRefreshing, 0, 1) {
-		wg := sync.WaitGroup{}
-		defer func() {
-			atomic.CompareAndSwapInt32(&blackListRefreshing, 1, 0)
-		}()
+		go func() {
+			wg := sync.WaitGroup{}
+			defer func() {
+				atomic.CompareAndSwapInt32(&blackListRefreshing, 1, 0)
+			}()
 
-		ivks := GetBlackListInvokers(constant.DEFAULT_BLACK_LIST_RECOVER_BLOCK)
-		logger.Debug("blackList len = ", len(ivks))
+			ivks := GetBlackListInvokers(constant.DEFAULT_BLACK_LIST_RECOVER_BLOCK)
+			logger.Debug("blackList len = ", len(ivks))
 
-		for i := 0; i < 3; i++ {
-			wg.Add(1)
-			go func(ivks []Invoker, i int) {
-				defer wg.Done()
-				for j, _ := range ivks {
-					if j%3-i == 0 && ivks[j].(Invoker).IsAvailable() {
-						RemoveInvokerUnhealthyStatus(ivks[i])
+			for i := 0; i < 3; i++ {
+				wg.Add(1)
+				go func(ivks []Invoker, i int) {
+					defer wg.Done()
+					for j, _ := range ivks {
+						if j%3-i == 0 && ivks[j].(Invoker).IsAvailable() {
+							RemoveInvokerUnhealthyStatus(ivks[i])
+						}
 					}
-				}
-			}(ivks, i)
-		}
-		wg.Wait()
+				}(ivks, i)
+			}
+			wg.Wait()
+		}()
 	}
 }
